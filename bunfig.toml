@@ -1,0 +1,3 @@
+[install]
+# Hoist dependencies for workspace consistency
+linker = "hoisted"
