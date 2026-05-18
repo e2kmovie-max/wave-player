@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { isIP } from "node:net";
 import { decrypt, randomCode } from "./crypto";
 import { GoogleAccount, Instance, Room } from "./models";
 import {
@@ -83,6 +84,25 @@ export class WatchPartyError extends Error {
   }
 }
 
+/**
+ * When false (the default and the only sensible production setting), URLs
+ * that resolve to a literal loopback / RFC1918 / link-local IP are rejected
+ * by [normalizeVideoUrl]. Tests flip this to `true` to keep using
+ * `http://127.0.0.1:1234/...` fixtures without poking at process.env.
+ *
+ * The Go instance enforces the same check at the network edge — this guard
+ * is a faster, friendlier error for the master to surface so the user does
+ * not have to wait for yt-dlp to give up.
+ */
+let allowPrivateVideoTargets =
+  process.env.WAVE_ALLOW_PRIVATE_VIDEO_TARGETS === "1" ||
+  process.env.NODE_ENV === "test";
+
+/** Test-only escape hatch — mirrors WAVE_ALLOW_PRIVATE_VIDEO_TARGETS. */
+export function __setAllowPrivateVideoTargetsForTests(allow: boolean): void {
+  allowPrivateVideoTargets = allow;
+}
+
 export function normalizeVideoUrl(input: string): string {
   const trimmed = input.trim();
   let parsed: URL;
@@ -94,7 +114,65 @@ export function normalizeVideoUrl(input: string): string {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new WatchPartyError("Only http(s) video URLs are supported.", 400);
   }
+  if (!parsed.hostname) {
+    throw new WatchPartyError("Enter a valid http(s) video URL.", 400);
+  }
+  // Userinfo (user:pass@host) is a classic SSRF / phishing payload vector and
+  // yt-dlp itself ignores it. Refuse it outright to keep our logs clean.
+  if (parsed.username || parsed.password) {
+    throw new WatchPartyError("Video URLs must not embed credentials.", 400);
+  }
+  if (!allowPrivateVideoTargets && isPrivateHostname(parsed.hostname)) {
+    throw new WatchPartyError(
+      "Video URLs must point at a public host (no localhost / private IPs).",
+      400,
+    );
+  }
   return parsed.toString();
+}
+
+function isPrivateHostname(host: string): boolean {
+  const lower = host.toLowerCase();
+  if (lower === "localhost" || lower === "ip6-localhost" || lower === "ip6-loopback") {
+    return true;
+  }
+  // [::1] etc. come in with surrounding brackets stripped by URL; isIP wants
+  // the bare literal.
+  const stripped = lower.replace(/^\[|\]$/g, "");
+  const version = isIP(stripped);
+  if (version === 0) return false;
+  if (version === 4) return isPrivateIPv4(stripped);
+  return isPrivateIPv6(stripped);
+}
+
+function isPrivateIPv4(ip: string): boolean {
+  const parts = ip.split(".").map((p) => Number(p));
+  if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) {
+    return false;
+  }
+  const [a, b] = parts as [number, number, number, number];
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 0) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a >= 224) return true; // multicast + reserved
+  return false;
+}
+
+function isPrivateIPv6(ip: string): boolean {
+  const lower = ip.toLowerCase();
+  if (lower === "::" || lower === "::1") return true;
+  // Unique local addresses (fc00::/7) and link-local (fe80::/10).
+  if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
+  if (lower.startsWith("fe80:") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) {
+    return true;
+  }
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d) — peek at the embedded IPv4 portion.
+  const mapped = lower.match(/^::ffff:([0-9.]+)$/);
+  if (mapped && isPrivateIPv4(mapped[1]!)) return true;
+  return false;
 }
 
 export async function selectStreamingInstance(): Promise<InstanceRecord> {
@@ -216,7 +294,7 @@ export async function withCookieRotation<T>(
   throw new WatchPartyError("Cookie rotation exhausted unexpectedly.", 500);
 }
 
-export async function previewVideo(urlInput: string): Promise<{
+export interface PreviewResult {
   url: string;
   instance: InstanceRecord;
   info: InstanceInfo;
@@ -225,8 +303,63 @@ export async function previewVideo(urlInput: string): Promise<{
   quality: string;
   cookieAccountId: string | null;
   cookieRotations: number;
-}> {
+}
+
+/**
+ * TTL for the in-memory `/info` cache (milliseconds). yt-dlp metadata is
+ * effectively static for a given URL over a short horizon, so coalescing
+ * repeat lookups (e.g. a user clicking "Create" twice, or the web preview
+ * preflight followed immediately by an actual room create) avoids paying for
+ * a second yt-dlp invocation that would also burn a cookie rotation slot.
+ */
+export const PREVIEW_CACHE_TTL_MS = 90_000;
+const PREVIEW_CACHE_MAX_ENTRIES = 128;
+
+interface PreviewCacheEntry {
+  expiresAt: number;
+  result: Omit<PreviewResult, "instance"> & { instanceId: string };
+}
+
+const previewCache = new Map<string, PreviewCacheEntry>();
+
+function previewCacheGet(key: string): PreviewCacheEntry | null {
+  const entry = previewCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt < Date.now()) {
+    previewCache.delete(key);
+    return null;
+  }
+  // Refresh LRU position so heavy hitters survive eviction.
+  previewCache.delete(key);
+  previewCache.set(key, entry);
+  return entry;
+}
+
+function previewCachePut(key: string, entry: PreviewCacheEntry): void {
+  if (previewCache.size >= PREVIEW_CACHE_MAX_ENTRIES) {
+    const oldest = previewCache.keys().next().value;
+    if (oldest) previewCache.delete(oldest);
+  }
+  previewCache.set(key, entry);
+}
+
+/** Test-only — clears the in-memory preview cache between tests. */
+export function __resetPreviewCacheForTests(): void {
+  previewCache.clear();
+}
+
+export async function previewVideo(urlInput: string): Promise<PreviewResult> {
   const url = normalizeVideoUrl(urlInput);
+  const cached = previewCacheGet(url);
+  if (cached) {
+    const instance = await loadInstanceById(cached.result.instanceId);
+    if (instance) {
+      const { instanceId: _ignored, ...rest } = cached.result;
+      return { ...rest, instance };
+    }
+    // Instance went away — fall through to a fresh lookup.
+  }
+
   const instance = await selectStreamingInstance();
   const client = new InstanceClient({ url: instance.url, secret: instance.secret });
 
@@ -243,7 +376,7 @@ export async function previewVideo(urlInput: string): Promise<{
   if (!first) {
     throw new WatchPartyError("The instance returned no streamable formats for this video.", 502);
   }
-  return {
+  const result: PreviewResult = {
     url,
     instance,
     info,
@@ -253,6 +386,33 @@ export async function previewVideo(urlInput: string): Promise<{
     cookieAccountId: credentials.accountId,
     cookieRotations: attempts - 1,
   };
+  previewCachePut(url, {
+    expiresAt: Date.now() + PREVIEW_CACHE_TTL_MS,
+    result: {
+      url,
+      info,
+      formats,
+      selectedFormatId: first.formatId,
+      quality: first.label,
+      cookieAccountId: credentials.accountId,
+      cookieRotations: attempts - 1,
+      instanceId: String(instance._id),
+    },
+  });
+  return result;
+}
+
+async function loadInstanceById(id: string): Promise<InstanceRecord | null> {
+  try {
+    const doc = await Instance.findOne({
+      _id: new Types.ObjectId(id),
+      enabled: true,
+      isHealthy: true,
+    }).lean<InstanceRecord | null>();
+    return doc;
+  } catch {
+    return null;
+  }
 }
 
 export async function createWatchRoom(input: {

@@ -5,12 +5,22 @@ import { z } from "zod";
  *
  * Each app extends this with its own additional vars where needed.
  */
+
+/**
+ * Sentinel APP_SECRET used for local development. Exported so callers and
+ * tests can recognise the unsafe default without hard-coding the literal.
+ * Production deployments must override it; [getEnv] enforces this whenever
+ * NODE_ENV === "production" unless WAVE_ALLOW_INSECURE_APP_SECRET=1 is set
+ * (escape hatch for one-off scripts, never for the running service).
+ */
+export const DEV_APP_SECRET = "dev-only-app-secret-replace-me-please";
+
 const baseSchema = z.object({
   MONGODB_URI: z
     .string()
     .min(1)
     .default("mongodb://wave:wave@localhost:27017/wave?authSource=admin"),
-  APP_SECRET: z.string().min(16).default("dev-only-app-secret-replace-me-please"),
+  APP_SECRET: z.string().min(16).default(DEV_APP_SECRET),
   PUBLIC_WEB_URL: z.string().url().default("http://localhost:3000"),
 
   GOOGLE_CLIENT_ID: z.string().optional().default(""),
@@ -93,8 +103,24 @@ export function getEnv(): WaveEnv {
     const fieldErrors = JSON.stringify(flat.fieldErrors, null, 2);
     throw new Error(`Invalid environment variables:\n${fieldErrors}`);
   }
+  // Hard guard: never ship the dev-only sentinel secret in production. With
+  // it, AES-GCM cookie storage and HMAC session tokens collapse to "anyone
+  // who can read the source can decrypt them" — there is no in-between.
+  const isProd = (process.env.NODE_ENV ?? "").toLowerCase() === "production";
+  const allowInsecure = process.env.WAVE_ALLOW_INSECURE_APP_SECRET === "1";
+  if (isProd && !allowInsecure && parsed.data.APP_SECRET === DEV_APP_SECRET) {
+    throw new Error(
+      "APP_SECRET is set to the dev-only default in production. " +
+        "Generate a strong secret (e.g. openssl rand -hex 32) and set it on the deploy environment.",
+    );
+  }
   cached = parsed.data;
   return cached;
+}
+
+/** Test-only — drops the memoised env so tests can re-parse process.env. */
+export function __resetEnvCacheForTests(): void {
+  cached = null;
 }
 
 export function isGoogleOAuthConfigured(env = getEnv()): boolean {

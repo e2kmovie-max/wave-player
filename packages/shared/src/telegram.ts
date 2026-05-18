@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 /**
  * Verifies and parses Telegram Mini App `initData` per the spec:
@@ -59,14 +59,17 @@ export function verifyTelegramInitData(
   const dataCheckString = entries.map(([k, v]) => `${k}=${v}`).join("\n");
 
   const secretKey = createHmac("sha256", "WebAppData").update(botToken).digest();
-  const expected = createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
+  const expected = createHmac("sha256", secretKey).update(dataCheckString).digest();
 
-  if (expected.length !== hash.length) return null;
-  let diff = 0;
-  for (let i = 0; i < expected.length; i++) {
-    diff |= expected.charCodeAt(i) ^ hash.charCodeAt(i);
+  // The hash param is hex. Reject anything else outright so we cannot crash
+  // Buffer.from on stray characters, and so the constant-time comparison
+  // below always runs on byte buffers of equal length.
+  if (!/^[0-9a-f]+$/i.test(hash) || hash.length !== expected.length * 2) {
+    return null;
   }
-  if (diff !== 0) return null;
+  const provided = Buffer.from(hash, "hex");
+  if (provided.length !== expected.length) return null;
+  if (!timingSafeEqual(provided, expected)) return null;
 
   const authDate = Number(params.get("auth_date") ?? 0);
   if (!Number.isFinite(authDate) || authDate <= 0) return null;

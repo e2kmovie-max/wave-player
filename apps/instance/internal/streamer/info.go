@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os/exec"
 )
 
@@ -16,8 +15,12 @@ import (
 // optional cookies file, then trims the response down to the fields the
 // master node actually consumes.
 func FetchInfo(ctx context.Context, opts InfoOptions) (*Info, error) {
-	if _, err := url.ParseRequestURI(opts.URL); err != nil {
-		return nil, fmt.Errorf("invalid url: %w", err)
+	if err := ValidateSourceURL(opts.URL); err != nil {
+		return nil, &PipelineError{
+			Code:    ErrorCodeUnknown,
+			Message: err.Error(),
+			Wrapped: err,
+		}
 	}
 
 	args := []string{
@@ -25,6 +28,9 @@ func FetchInfo(ctx context.Context, opts InfoOptions) (*Info, error) {
 		"--no-warnings",
 		"--no-playlist",
 		"--no-progress",
+		"--no-call-home",
+		"--no-check-certificates",
+		"--socket-timeout", "15",
 		"--quiet",
 	}
 	if opts.CookiesFile != "" {
