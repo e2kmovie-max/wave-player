@@ -55,18 +55,44 @@ export class InstancePoolError extends Error {
   }
 }
 
-const URL_RE = /^https?:\/\/[^\s]+$/i;
+/**
+ * Validate and normalise an instance URL. Returns the canonical string (no
+ * trailing slash) or throws an [InstancePoolError] with a human-readable
+ * reason. The actual URL parser is used (rather than the previous regex)
+ * because the regex happily accepted things like `http://` with no host.
+ */
+export function normalizeInstanceUrl(raw: string): string {
+  const trimmed = raw.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new InstancePoolError("URL must start with http:// or https://");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new InstancePoolError("URL must start with http:// or https://");
+  }
+  if (!parsed.hostname) {
+    throw new InstancePoolError("URL is missing a hostname.");
+  }
+  // Strip default ports and trailing slashes so duplicate detection works
+  // regardless of cosmetic differences between admin inputs.
+  parsed.hash = "";
+  parsed.search = "";
+  let out = parsed.toString();
+  while (out.endsWith("/") && !out.endsWith("://")) {
+    out = out.slice(0, -1);
+  }
+  return out;
+}
 
 export async function addAdminInstance(
   input: AddInstanceInput,
 ): Promise<HydratedDocument<InstanceDoc>> {
   const name = input.name.trim();
-  const url = input.url.trim().replace(/\/$/, "");
+  const url = normalizeInstanceUrl(input.url);
   const secret = input.secret.trim();
   if (!name) throw new InstancePoolError("Instance name is required.");
-  if (!URL_RE.test(url)) {
-    throw new InstancePoolError("URL must start with http:// or https://");
-  }
   if (!secret) throw new InstancePoolError("HMAC secret is required.");
 
   const existing = await Instance.findOne({ url });

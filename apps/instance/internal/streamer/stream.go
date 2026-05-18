@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os/exec"
 	"sync/atomic"
 )
@@ -19,6 +18,12 @@ type StreamOptions struct {
 	UserAgent    string
 	YTDLPBinary  string // defaults to "yt-dlp"
 	FFmpegBinary string // defaults to "ffmpeg"
+
+	// ThrottledRateBytesPerSecond, when > 0, asks yt-dlp to back off if the
+	// per-fragment throughput drops below this many bytes/sec. Lets us
+	// reclaim sockets stuck behind a slow client without killing every other
+	// stream on the instance.
+	ThrottledRateBytesPerSecond int
 }
 
 // PipelineResult summarises what happened during a Pipeline run. BytesOut is
@@ -49,11 +54,11 @@ func Pipeline(ctx context.Context, dst io.Writer, opts StreamOptions) PipelineRe
 			Wrapped: errors.New("nil writer"),
 		}}
 	}
-	if _, err := url.ParseRequestURI(opts.URL); err != nil {
+	if err := ValidateSourceURL(opts.URL); err != nil {
 		return PipelineResult{Err: &PipelineError{
 			Code:    ErrorCodeUnknown,
-			Message: "invalid url",
-			Wrapped: fmt.Errorf("invalid url: %w", err),
+			Message: err.Error(),
+			Wrapped: err,
 		}}
 	}
 
@@ -71,6 +76,9 @@ func Pipeline(ctx context.Context, dst io.Writer, opts StreamOptions) PipelineRe
 		"--no-warnings",
 		"--no-playlist",
 		"--no-progress",
+		"--no-call-home",
+		"--no-mtime",
+		"--socket-timeout", "15",
 		"--quiet",
 	}
 	if opts.FormatID != "" {
@@ -81,6 +89,9 @@ func Pipeline(ctx context.Context, dst io.Writer, opts StreamOptions) PipelineRe
 	}
 	if opts.UserAgent != "" {
 		ytArgs = append(ytArgs, "--user-agent", opts.UserAgent)
+	}
+	if opts.ThrottledRateBytesPerSecond > 0 {
+		ytArgs = append(ytArgs, "--throttled-rate", fmt.Sprintf("%dK", opts.ThrottledRateBytesPerSecond/1024))
 	}
 	ytArgs = append(ytArgs, "--", opts.URL)
 

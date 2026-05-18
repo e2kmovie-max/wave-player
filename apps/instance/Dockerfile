@@ -17,17 +17,20 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ─── Runtime: ffmpeg + yt-dlp + the binary ────────────────────────────
 FROM alpine:3.20
 
-# yt-dlp is distributed as a Python script; ffmpeg-static is in apk's main repo.
+# yt-dlp + streamlink are both Python scripts; ffmpeg-static comes from apk.
 # pipx install isn't worth the layer churn — pip --break-system-packages is fine
-# in a Docker layer that owns the OS Python.
+# in a Docker layer that owns the OS Python. Streamlink is optional but the
+# Go server auto-detects it on PATH and routes Twitch URLs through it for
+# better live behaviour than yt-dlp.
 RUN apk add --no-cache \
         ca-certificates \
         ffmpeg \
         python3 \
         py3-pip \
         tzdata \
-    && pip3 install --no-cache-dir --break-system-packages yt-dlp \
+    && pip3 install --no-cache-dir --break-system-packages yt-dlp streamlink \
     && yt-dlp --version \
+    && streamlink --version \
     && ffmpeg -version | head -n 1 \
     && adduser -D -H -u 10001 wave
 

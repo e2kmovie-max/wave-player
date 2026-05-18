@@ -25,11 +25,24 @@ import (
 
 // Config is the runtime configuration for the HTTP server.
 type Config struct {
-	Verifier      *auth.Verifier
-	YTDLPBinary   string
-	FFmpegBinary  string
-	StartedAt     time.Time
-	MaxStreams    int32 // 0 ⇒ no cap
+	Verifier         *auth.Verifier
+	YTDLPBinary      string
+	FFmpegBinary     string
+	StreamlinkBinary string
+	StartedAt        time.Time
+	MaxStreams       int32 // 0 ⇒ no cap
+
+	// ThrottledRateBytesPerSecond, when > 0, is forwarded to yt-dlp via
+	// --throttled-rate so a single slow client cannot starve the rest of
+	// the instance.
+	ThrottledRateBytesPerSecond int
+
+	// UseStreamlinkForTwitch routes Twitch URLs through streamlink instead
+	// of yt-dlp. Default true when StreamlinkBinary resolves on PATH.
+	UseStreamlinkForTwitch bool
+
+	// EnableTwitchAdSkip toggles streamlink's --twitch-disable-ads flag.
+	EnableTwitchAdSkip bool
 }
 
 // Server is an http.Handler that owns the instance state.
@@ -41,8 +54,9 @@ type Server struct {
 }
 
 type toolVersions struct {
-	YTDLP  string `json:"ytDlp"`
-	FFmpeg string `json:"ffmpeg"`
+	YTDLP      string `json:"ytDlp"`
+	FFmpeg     string `json:"ffmpeg"`
+	Streamlink string `json:"streamlink,omitempty"`
 }
 
 // New constructs the HTTP handler.
@@ -59,6 +73,17 @@ func New(cfg Config) *Server {
 	s := &Server{cfg: cfg, mux: http.NewServeMux()}
 	s.routes()
 	s.refreshToolVersions()
+	// Auto-enable Twitch→streamlink routing if streamlink is present on PATH
+	// and the caller did not explicitly opt out. This lets operators just
+	// `apt install streamlink` to get faster Twitch playback.
+	if s.cfg.StreamlinkBinary == "" {
+		if p, err := exec.LookPath("streamlink"); err == nil {
+			s.cfg.StreamlinkBinary = p
+		}
+	}
+	if s.cfg.StreamlinkBinary != "" && !s.cfg.UseStreamlinkForTwitch {
+		s.cfg.UseStreamlinkForTwitch = true
+	}
 	return s
 }
 
@@ -110,12 +135,12 @@ type infoRequest struct {
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	var req infoRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, streamer.ErrorCodeUnknown, "invalid json: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.URL) == "" {
-		writeError(w, http.StatusBadRequest, streamer.ErrorCodeUnknown, "url is required")
+	if err := streamer.ValidateSourceURL(req.URL); err != nil {
+		writeError(w, http.StatusBadRequest, streamer.ErrorCodeUnknown, err.Error())
 		return
 	}
 
@@ -160,12 +185,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req streamRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, streamer.ErrorCodeUnknown, "invalid json: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.URL) == "" {
-		writeError(w, http.StatusBadRequest, streamer.ErrorCodeUnknown, "url is required")
+	if err := streamer.ValidateSourceURL(req.URL); err != nil {
+		writeError(w, http.StatusBadRequest, streamer.ErrorCodeUnknown, err.Error())
 		return
 	}
 
@@ -189,14 +214,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	result := streamer.Pipeline(r.Context(), headerOnce, streamer.StreamOptions{
-		URL:          req.URL,
-		FormatID:     req.FormatID,
-		CookiesFile:  cookieFilePath(cookieFile),
-		UserAgent:    req.UserAgent,
-		YTDLPBinary:  s.cfg.YTDLPBinary,
-		FFmpegBinary: s.cfg.FFmpegBinary,
-	})
+	var result streamer.PipelineResult
+	if s.cfg.UseStreamlinkForTwitch && s.cfg.StreamlinkBinary != "" && streamer.IsTwitchURL(req.URL) {
+		result = streamer.PipelineStreamlink(r.Context(), headerOnce, streamer.StreamlinkOptions{
+			URL:              req.URL,
+			Quality:          twitchQuality(req.FormatID),
+			StreamlinkBinary: s.cfg.StreamlinkBinary,
+			FFmpegBinary:     s.cfg.FFmpegBinary,
+			UserAgent:        req.UserAgent,
+			DisableAds:       s.cfg.EnableTwitchAdSkip,
+		})
+	} else {
+		result = streamer.Pipeline(r.Context(), headerOnce, streamer.StreamOptions{
+			URL:                         req.URL,
+			FormatID:                    req.FormatID,
+			CookiesFile:                 cookieFilePath(cookieFile),
+			UserAgent:                   req.UserAgent,
+			YTDLPBinary:                 s.cfg.YTDLPBinary,
+			FFmpegBinary:                s.cfg.FFmpegBinary,
+			ThrottledRateBytesPerSecond: s.cfg.ThrottledRateBytesPerSecond,
+		})
+	}
 
 	if result.Err != nil && result.BytesOut == 0 {
 		// Nothing has been flushed yet, so we can still return a JSON error.
@@ -260,8 +298,8 @@ func writeError(w http.ResponseWriter, status int, code streamer.ErrorCode, mess
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-// refreshToolVersions probes yt-dlp and ffmpeg once at startup and stores the
-// strings for /health to report.
+// refreshToolVersions probes yt-dlp, ffmpeg and (when configured) streamlink
+// once at startup and stores the strings for /health to report.
 func (s *Server) refreshToolVersions() {
 	v := &toolVersions{}
 	if out, err := exec.Command(s.cfg.YTDLPBinary, "--version").Output(); err == nil {
@@ -272,5 +310,40 @@ func (s *Server) refreshToolVersions() {
 		first, _, _ := strings.Cut(string(out), "\n")
 		v.FFmpeg = strings.TrimSpace(first)
 	}
+	if s.cfg.StreamlinkBinary != "" {
+		if out, err := exec.Command(s.cfg.StreamlinkBinary, "--version").Output(); err == nil {
+			first, _, _ := strings.Cut(string(out), "\n")
+			v.Streamlink = strings.TrimSpace(first)
+		}
+	}
 	s.infoVer.Store(v)
+}
+
+// decodeJSON reads an HMAC-verified body (already bounded by auth.MaxSignedBodyBytes)
+// and rejects unknown fields so a misbehaving master cannot smuggle data the
+// instance silently ignores.
+func decodeJSON(r *http.Request, dst any) error {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	return dec.Decode(dst)
+}
+
+// twitchQuality maps an opaque formatId (passed through from the master) into
+// a streamlink quality token. Streamlink does not understand yt-dlp format
+// strings, so unrecognised inputs fall back to "best".
+func twitchQuality(formatID string) string {
+	switch strings.ToLower(strings.TrimSpace(formatID)) {
+	case "", "best", "bestvideo", "bestvideo+bestaudio":
+		return "best"
+	case "worst":
+		return "worst"
+	}
+	// Pass-through for explicit twitch quality tokens like "720p60" or "audio_only".
+	// Keep it ASCII-only as a tiny defensive measure against shell-quoting bugs.
+	for _, r := range formatID {
+		if r < 0x20 || r > 0x7e || r == ' ' {
+			return "best"
+		}
+	}
+	return formatID
 }
