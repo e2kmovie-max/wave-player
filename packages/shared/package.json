@@ -10,10 +10,20 @@
     "./env": "./src/env.ts",
     "./crypto": "./src/crypto.ts",
     "./telegram": "./src/telegram.ts",
+    "./telegram-notify": "./src/telegram-notify.ts",
+    "./tg-link": "./src/tg-link.ts",
     "./instance-client": "./src/instance-client.ts",
     "./instance-sync": "./src/instance-sync.ts",
     "./watch-party": "./src/watch-party.ts",
-    "./i18n": "./src/i18n.ts"
+    "./i18n": "./src/i18n.ts",
+    "./video-service": "./src/video-service.ts",
+    "./presence": "./src/presence.ts",
+    "./format": "./src/format.ts",
+    "./friends": "./src/friends.ts",
+    "./friend-discovery": "./src/friend-discovery.ts",
+    "./friend-rate-limit": "./src/friend-rate-limit.ts",
+    "./friend-actions": "./src/friend-actions.ts",
+    "./notifications": "./src/notifications.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
